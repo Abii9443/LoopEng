@@ -1,297 +1,294 @@
-"""Loop 1: Agent Loop - Core LangChain agent with tool calling."""
-import json
+"""Loop 1: Agent Loop - Main review processing pipeline."""
 import time
-from pathlib import Path
-from typing import Dict, Any, List
+from datetime import datetime
+from typing import Optional
+from uuid import uuid4
+import structlog
 
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.schema import SystemMessage, HumanMessage
+from src.config import settings, prompt_manager
+from src.models.review import Review
+from src.models.trace import ExecutionTrace, AgentStep, ToolCall
+from src.tools import SentimentAnalyzer, IssueExtractor, UrgencyClassifier, knowledge_base
+from src.agents.response_generator import ResponseGenerator
+from src.storage.trace_store import TraceStore
 
-from src.config import settings
-from src.models.review_models import ReviewResult, Issue
-from src.tools.git_tools import get_git_diff, get_changed_files, get_file_content
-from src.tools.linter_tools import run_pylint, run_flake8
-from src.tools.ast_tools import parse_ast, check_complexity
-from src.tools.static_analysis import check_security, check_imports
+logger = structlog.get_logger()
 
 
 class AgentLoop:
-    """Loop 1: LangChain agent that uses tools to review code."""
+    """
+    Loop 1: Agent Loop.
 
-    def __init__(self, prompt_version: str = "base"):
+    Processes reviews through the full pipeline:
+    1. Sentiment analysis
+    2. Issue extraction
+    3. Urgency classification
+    4. Knowledge base query
+    5. Response generation
+    6. Trace logging
+    """
+
+    def __init__(self):
+        """Initialize agent loop with all tools."""
+        self.sentiment_analyzer = SentimentAnalyzer()
+        self.issue_extractor = IssueExtractor()
+        self.urgency_classifier = UrgencyClassifier()
+        self.response_generator = ResponseGenerator()
+        self.trace_store = TraceStore()
+
+        logger.info("Agent Loop initialized")
+
+    async def process_review(
+        self,
+        review: Review,
+        feedback: Optional[str] = None,
+        original_response: Optional[str] = None,
+        version: int = 1
+    ) -> ExecutionTrace:
         """
-        Initialize the agent loop.
+        Process a review through the agent pipeline.
 
         Args:
-            prompt_version: Version of the prompt to use (base or optimized)
-        """
-        self.prompt_version = prompt_version
-        self.llm = ChatOpenAI(
-            model=settings.model_name,
-            temperature=0,
-            api_key=settings.openai_api_key,
-        )
-
-        # Load prompt
-        self.system_prompt = self._load_prompt(prompt_version)
-
-        # Define tools
-        self.tools = [
-            get_git_diff,
-            get_changed_files,
-            get_file_content,
-            run_pylint,
-            run_flake8,
-            parse_ast,
-            check_complexity,
-            check_security,
-            check_imports,
-        ]
-
-        # Create agent
-        self.agent = self._create_agent()
-
-    def _load_prompt(self, version: str) -> str:
-        """Load prompt from JSON file."""
-        prompt_file = settings.prompts_dir / "base_prompts.json"
-        optimized_file = settings.prompts_dir / "optimized_prompts.json"
-
-        try:
-            if version != "base" and optimized_file.exists():
-                with open(optimized_file, 'r') as f:
-                    prompts = json.load(f)
-                    return prompts.get("code_review_prompt", self._load_base_prompt())
-            else:
-                return self._load_base_prompt()
-        except Exception as e:
-            print(f"[Loop 1] Warning: Could not load prompt, using default: {e}")
-            return self._load_base_prompt()
-
-    def _load_base_prompt(self) -> str:
-        """Load base prompt."""
-        prompt_file = settings.prompts_dir / "base_prompts.json"
-        with open(prompt_file, 'r') as f:
-            prompts = json.load(f)
-            return prompts["code_review_prompt"]
-
-    def _create_agent(self) -> AgentExecutor:
-        """Create the LangChain agent with tools."""
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", self.system_prompt),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
-
-        agent = create_openai_tools_agent(self.llm, self.tools, prompt)
-        agent_executor = AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=True,
-            max_iterations=15,
-            handle_parsing_errors=True,
-        )
-
-        return agent_executor
-
-    def review_code(self, git_diff: str = None, context: Dict[str, Any] = None) -> tuple[ReviewResult, Dict[str, Any]]:
-        """
-        Perform code review using the agent.
-
-        Args:
-            git_diff: Optional pre-fetched git diff
-            context: Optional context (e.g., feedback from verification loop)
+            review: The review to process
+            feedback: Feedback for retry (optional)
+            original_response: Original response for retry (optional)
+            version: Response version number (for retries)
 
         Returns:
-            Tuple of (ReviewResult, metrics dict)
+            ExecutionTrace with complete execution record
         """
-        print("\n[Loop 1] 🤖 Agent Loop - Starting code review")
         start_time = time.time()
+        trace_id = str(uuid4())
 
-        try:
-            # Build input
-            if context and context.get('feedback'):
-                feedback_text = "\n\nPREVIOUS FEEDBACK TO ADDRESS:\n" + "\n".join(context['feedback'])
-                input_text = f"Review the code changes and address the feedback provided.{feedback_text}"
-            else:
-                input_text = "Review the current code changes. Start by getting the git diff or changed files, then analyze each file."
-
-            # Invoke agent
-            print("[Loop 1]   Invoking agent with tools...")
-            result = self.agent.invoke({"input": input_text})
-
-            # Extract output
-            agent_output = result.get('output', '')
-            print(f"[Loop 1]   Agent completed analysis")
-
-            # Parse the output into structured format
-            review_result = self._parse_agent_output(agent_output, result)
-
-            # Calculate metrics
-            duration = time.time() - start_time
-            review_result.duration = duration
-
-            metrics = {
-                'tools_used': self._extract_tools_used(result),
-                'duration': duration,
-                'issues_found': len(review_result.issues),
-                'prompt_version': self.prompt_version,
-            }
-
-            print(f"[Loop 1] ✅ Review complete: {len(review_result.issues)} issues found in {duration:.2f}s")
-
-            return review_result, metrics
-
-        except Exception as e:
-            print(f"[Loop 1] ❌ Error during review: {str(e)}")
-            # Return minimal result
-            review_result = ReviewResult(
-                issues=[],
-                summary=f"Error during review: {str(e)}",
-                files_reviewed=[],
-                tools_used=[],
-            )
-            metrics = {
-                'tools_used': [],
-                'duration': time.time() - start_time,
-                'issues_found': 0,
-                'error': str(e),
-            }
-            return review_result, metrics
-
-    def _parse_agent_output(self, output: str, agent_result: Dict) -> ReviewResult:
-        """
-        Parse agent output into structured ReviewResult.
-
-        This is a simplified parser. In production, you'd use structured output.
-        """
-        # Try to extract issues from the output
-        issues = self._extract_issues_from_output(output)
-
-        # Get files that were reviewed
-        files_reviewed = self._extract_files_from_intermediate(agent_result)
-
-        # Get tools used
-        tools_used = self._extract_tools_used(agent_result)
-
-        return ReviewResult(
-            issues=issues,
-            summary=self._generate_summary(output, issues),
-            files_reviewed=files_reviewed,
-            tools_used=tools_used,
+        logger.info(
+            "Starting review processing",
+            trace_id=trace_id,
+            review_id=review.id,
+            version=version
         )
 
-    def _extract_issues_from_output(self, output: str) -> List[Issue]:
-        """Extract issues from agent output text."""
-        issues = []
+        # Initialize trace
+        trace = ExecutionTrace(
+            id=trace_id,
+            review_id=review.id,
+            timestamp=datetime.now(),
+            steps=[],
+            tools_used=[],
+            duration_ms=0,
+            response=None,  # Will be set later
+            verification=None,
+            prompt_version=prompt_manager.get_version(),
+            model_config={"generation_model": settings.generation_model},
+            success=False
+        )
 
-        # Look for common patterns in output
-        lines = output.split('\n')
+        try:
+            # Step 1: Sentiment Analysis
+            step1_start = time.time()
+            sentiment_result = self.sentiment_analyzer.analyze(review.text)
+            review.sentiment = sentiment_result
+            sentiment_label = sentiment_result.label
 
-        current_file = None
-        for line in lines:
-            line = line.strip()
+            trace.steps.append(AgentStep(
+                step_id=f"{trace_id}_step1",
+                action="sentiment_analysis",
+                input={"text": review.text},
+                output={
+                    "sentiment": sentiment_label,
+                    "score": sentiment_result.score,
+                    "confidence": sentiment_result.confidence
+                },
+                duration_ms=int((time.time() - step1_start) * 1000),
+                tool_calls=[ToolCall(
+                    tool_name="SentimentAnalyzer",
+                    arguments={"text": review.text},
+                    result=sentiment_result.model_dump(),
+                    duration_ms=int((time.time() - step1_start) * 1000)
+                )]
+            ))
+            trace.tools_used.append("SentimentAnalyzer")
 
-            # Try to detect file mentions
-            if '.py' in line and ('/' in line or 'File' in line):
-                # Extract filename
-                for word in line.split():
-                    if '.py' in word:
-                        current_file = word.strip(':').strip()
+            logger.debug(
+                "Sentiment analysis complete",
+                trace_id=trace_id,
+                sentiment=sentiment_label
+            )
 
-            # Look for severity indicators
-            severity = 'info'
-            if any(word in line.lower() for word in ['critical', 'security', 'vulnerability', 'injection']):
-                severity = 'critical'
-            elif any(word in line.lower() for word in ['error', 'bug', 'major', 'warning']):
-                severity = 'major'
-            elif any(word in line.lower() for word in ['style', 'convention', 'minor']):
-                severity = 'minor'
+            # Step 2: Issue Extraction
+            step2_start = time.time()
+            issues = self.issue_extractor.extract(review.text, sentiment_label)
+            review.issues = issues
 
-            # Look for issue descriptions
-            if any(indicator in line.lower() for indicator in ['issue:', 'problem:', 'warning:', 'error:', '⚠️', '🔒']):
-                description = line
+            trace.steps.append(AgentStep(
+                step_id=f"{trace_id}_step2",
+                action="issue_extraction",
+                input={"text": review.text, "sentiment": sentiment_label},
+                output={
+                    "num_issues": len(issues),
+                    "issues": [issue.model_dump() for issue in issues]
+                },
+                duration_ms=int((time.time() - step2_start) * 1000),
+                tool_calls=[ToolCall(
+                    tool_name="IssueExtractor",
+                    arguments={"text": review.text, "sentiment": sentiment_label},
+                    result=[issue.model_dump() for issue in issues],
+                    duration_ms=int((time.time() - step2_start) * 1000)
+                )]
+            ))
+            trace.tools_used.append("IssueExtractor")
 
-                # Try to extract line number
-                line_num = 1
-                import re
-                line_match = re.search(r'line\s+(\d+)', line, re.IGNORECASE)
-                if line_match:
-                    line_num = int(line_match.group(1))
+            logger.debug(
+                "Issue extraction complete",
+                trace_id=trace_id,
+                num_issues=len(issues)
+            )
 
-                issues.append(Issue(
-                    file=current_file or 'unknown',
-                    line=line_num,
-                    severity=severity,
-                    category='general',
-                    description=description,
-                    suggestion="Review and fix the issue",
-                    tool_source="agent_analysis",
-                ))
+            # Step 3: Urgency Classification
+            step3_start = time.time()
+            urgency = self.urgency_classifier.classify(review, sentiment_label, issues)
+            review.urgency = urgency
 
-        # If no issues extracted but output mentions findings, create a general issue
-        if not issues and len(output) > 100:
-            issues.append(Issue(
-                file='general',
-                line=0,
-                severity='info',
-                category='general',
-                description='Code review completed - see full output',
-                suggestion=output[:500],
-                tool_source='agent_summary',
+            trace.steps.append(AgentStep(
+                step_id=f"{trace_id}_step3",
+                action="urgency_classification",
+                input={
+                    "rating": review.rating,
+                    "sentiment": sentiment_label,
+                    "num_issues": len(issues)
+                },
+                output={"urgency": urgency.value},
+                duration_ms=int((time.time() - step3_start) * 1000),
+                tool_calls=[]  # Rule-based, no external tool
             ))
 
-        return issues
+            logger.debug(
+                "Urgency classification complete",
+                trace_id=trace_id,
+                urgency=urgency.value
+            )
 
-    def _generate_summary(self, output: str, issues: List[Issue]) -> str:
-        """Generate summary from output and issues."""
-        if not issues:
-            return "No significant issues found in the code review."
+            # Step 4: Knowledge Base Query
+            step4_start = time.time()
+            similar_cases = knowledge_base.search(
+                query_text=review.text,
+                top_k=3,
+                sentiment_filter=sentiment_label,
+                min_score=0.7
+            )
 
-        critical = sum(1 for i in issues if i.severity == 'critical')
-        major = sum(1 for i in issues if i.severity == 'major')
-        minor = sum(1 for i in issues if i.severity == 'minor')
+            trace.steps.append(AgentStep(
+                step_id=f"{trace_id}_step4",
+                action="knowledge_base_search",
+                input={"query": review.text, "sentiment": sentiment_label},
+                output={
+                    "num_results": len(similar_cases),
+                    "results": [{"distance": r["distance"]} for r in similar_cases]
+                },
+                duration_ms=int((time.time() - step4_start) * 1000),
+                tool_calls=[ToolCall(
+                    tool_name="KnowledgeBase",
+                    arguments={"query": review.text, "top_k": 3},
+                    result={"num_results": len(similar_cases)},
+                    duration_ms=int((time.time() - step4_start) * 1000)
+                )]
+            ))
+            trace.tools_used.append("KnowledgeBase")
 
-        summary = f"Found {len(issues)} issue(s): "
-        parts = []
-        if critical > 0:
-            parts.append(f"{critical} critical")
-        if major > 0:
-            parts.append(f"{major} major")
-        if minor > 0:
-            parts.append(f"{minor} minor")
+            logger.debug(
+                "Knowledge base search complete",
+                trace_id=trace_id,
+                num_results=len(similar_cases)
+            )
 
-        summary += ", ".join(parts)
-        return summary
+            # Step 5: Response Generation
+            step5_start = time.time()
+            response = self.response_generator.generate(
+                review=review,
+                sentiment=sentiment_label,
+                issues=issues,
+                context=similar_cases,
+                feedback=feedback,
+                original_response=original_response,
+                version=version
+            )
 
-    def _extract_files_from_intermediate(self, agent_result: Dict) -> List[str]:
-        """Extract files that were analyzed from intermediate steps."""
-        files = set()
+            trace.steps.append(AgentStep(
+                step_id=f"{trace_id}_step5",
+                action="response_generation",
+                input={
+                    "sentiment": sentiment_label,
+                    "num_issues": len(issues),
+                    "context_size": len(similar_cases),
+                    "version": version
+                },
+                output={
+                    "response_id": response.id,
+                    "strategy": response.strategy,
+                    "length": len(response.text)
+                },
+                duration_ms=int((time.time() - step5_start) * 1000),
+                tool_calls=[ToolCall(
+                    tool_name="ResponseGenerator",
+                    arguments={"review_id": review.id, "sentiment": sentiment_label},
+                    result={"response_id": response.id},
+                    duration_ms=int((time.time() - step5_start) * 1000)
+                )]
+            ))
+            trace.tools_used.append("ResponseGenerator")
 
-        # Look through intermediate steps for file paths
-        intermediate_steps = agent_result.get('intermediate_steps', [])
-        for step in intermediate_steps:
-            if isinstance(step, tuple) and len(step) >= 2:
-                action, observation = step[0], step[1]
-                if hasattr(action, 'tool_input'):
-                    tool_input = action.tool_input
-                    if isinstance(tool_input, dict) and 'file_path' in tool_input:
-                        files.add(tool_input['file_path'])
-                    elif isinstance(tool_input, str) and '.py' in tool_input:
-                        files.add(tool_input)
+            logger.info(
+                "Response generation complete",
+                trace_id=trace_id,
+                response_id=response.id,
+                strategy=response.strategy
+            )
 
-        return list(files)
+            # Finalize trace
+            trace.response = response
+            trace.duration_ms = int((time.time() - start_time) * 1000)
+            trace.success = True
 
-    def _extract_tools_used(self, agent_result: Dict) -> List[str]:
-        """Extract list of tools that were called."""
-        tools = set()
+            # Step 6: Save trace
+            self.trace_store.save(trace)
 
-        intermediate_steps = agent_result.get('intermediate_steps', [])
-        for step in intermediate_steps:
-            if isinstance(step, tuple) and len(step) >= 1:
-                action = step[0]
-                if hasattr(action, 'tool'):
-                    tools.add(action.tool)
+            logger.info(
+                "Review processing complete",
+                trace_id=trace_id,
+                review_id=review.id,
+                duration_ms=trace.duration_ms,
+                success=True
+            )
 
-        return list(tools)
+            return trace
+
+        except Exception as e:
+            logger.error(
+                "Review processing failed",
+                trace_id=trace_id,
+                review_id=review.id,
+                error=str(e)
+            )
+
+            # Mark trace as failed
+            trace.duration_ms = int((time.time() - start_time) * 1000)
+            trace.success = False
+
+            # Create fallback response if not already set
+            if not trace.response:
+                trace.response = self.response_generator._create_fallback_response(
+                    review,
+                    sentiment_label if review.sentiment else "neutral",
+                    version
+                )
+
+            # Still save the trace for learning
+            try:
+                self.trace_store.save(trace)
+            except:
+                pass  # Don't fail on trace save failure
+
+            return trace
+
+    def get_stats(self) -> dict:
+        """Get agent loop statistics."""
+        return self.trace_store.get_stats()

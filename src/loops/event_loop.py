@@ -1,101 +1,215 @@
-"""Loop 3: Event-Driven Loop - Orchestrates reviews and triggers improvement."""
-import time
-from typing import Optional
+"""Loop 3: Event-Driven Loop - Async event processing and orchestration."""
+import asyncio
+from enum import Enum
+from typing import Optional, Callable, Any
+from datetime import datetime
+import structlog
 
-from src.config import settings
-from src.models.review_models import Trace
-from src.loops.verification_loop import VerificationLoop
-from src.storage.trace_store import TraceStore
-from src.utils.display import RichDisplay
-from src.tools.git_tools import get_git_diff
+from src.models.review import Review
+
+logger = structlog.get_logger()
+
+
+class EventType(str, Enum):
+    """Types of events in the system."""
+    NEW_REVIEW = "new_review"
+    VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_PASSED = "verification_passed"
+    HILL_CLIMBING_READY = "hill_climbing_ready"
+    IMPROVEMENT_AVAILABLE = "improvement_available"
+    BATCH_COMPLETE = "batch_complete"
+
+
+class Event:
+    """Event object."""
+
+    def __init__(self, event_type: EventType, data: Any, timestamp: Optional[datetime] = None):
+        """Initialize event."""
+        self.event_type = event_type
+        self.data = data
+        self.timestamp = timestamp or datetime.now()
+
+    def __repr__(self):
+        return f"Event({self.event_type}, timestamp={self.timestamp})"
 
 
 class EventLoop:
-    """Loop 3: Orchestrates the review process and manages events."""
+    """
+    Loop 3: Event-Driven Loop.
 
-    def __init__(self, prompt_version: str = "base"):
+    Provides async event processing with:
+    - Event queue management
+    - Event handlers registration
+    - Background task scheduling
+    - Rate limiting and backpressure
+    """
+
+    def __init__(self):
+        """Initialize event loop."""
+        self.event_queue = asyncio.Queue()
+        self.handlers = {}
+        self.running = False
+        self.tasks = []
+
+        logger.info("Event Loop initialized")
+
+    def register_handler(self, event_type: EventType, handler: Callable):
         """
-        Initialize the event loop.
+        Register an event handler.
 
         Args:
-            prompt_version: Version of prompt to use
+            event_type: Type of event to handle
+            handler: Async function to handle the event
         """
-        self.verification_loop = VerificationLoop(prompt_version=prompt_version)
-        self.trace_store = TraceStore()
-        self.display = RichDisplay()
-        self.improvement_frequency = settings.improvement_frequency
+        if event_type not in self.handlers:
+            self.handlers[event_type] = []
 
-    def handle_event(self, event_type: str, payload: dict = None) -> Optional[Trace]:
-        """
-        Handle a review event.
+        self.handlers[event_type].append(handler)
 
-        Args:
-            event_type: Type of event (manual_review, pre_commit, etc.)
-            payload: Optional event payload
-
-        Returns:
-            Trace object or None if no changes detected
-        """
-        self.display.show_header()
-        print(f"\n[Loop 3] 🎯 Event: {event_type} triggered")
-
-        start_time = time.time()
-
-        # Extract git diff
-        print("[Loop 3] 📝 Extracting git diff...")
-        git_diff_result = get_git_diff()
-
-        if "No changes detected" in git_diff_result:
-            print("[Loop 3] ℹ️  No changes detected in git working tree")
-            print("\n[dim]💡 Tip: Make some code changes and try again[/dim]")
-            return None
-
-        print(f"[Loop 3] Found changes to review")
-
-        # Run verified review (which calls Loop 2, which calls Loop 1)
-        self.display.show_progress("Running code review with verification...")
-        verified_review = self.verification_loop.verified_review(git_diff=git_diff_result)
-
-        # Calculate total duration
-        duration = time.time() - start_time
-
-        # Create trace
-        trace = Trace(
-            event_type=event_type,
-            git_diff=git_diff_result[:5000],  # Truncate for storage
-            verified_review=verified_review,
-            metrics={
-                'quality_score': verified_review.quality_score,
-                'retry_count': verified_review.retry_count,
-                'passed': verified_review.passed,
-                'issues_found': len(verified_review.review.issues),
-                'files_reviewed': len(verified_review.review.files_reviewed),
-                'tools_used': verified_review.review.tools_used,
-            },
-            duration=duration,
-            prompt_version=self.verification_loop.agent_loop.prompt_version,
+        logger.debug(
+            "Handler registered",
+            event_type=event_type.value,
+            handler=handler.__name__
         )
 
-        # Store trace
-        print(f"\n[Loop 3] 💾 Storing trace...")
-        filepath = self.trace_store.save(trace)
-        trace_count = self.trace_store.count()
-        print(f"[Loop 3] Trace saved: {filepath.name}")
+    async def emit(self, event_type: EventType, data: Any):
+        """
+        Emit an event to the queue.
 
-        # Display results
-        print("\n" + "=" * 60)
-        self.display.show_review(verified_review)
-        print()
-        self.display.show_metrics(trace)
-        print("=" * 60 + "\n")
+        Args:
+            event_type: Type of event
+            data: Event data
+        """
+        event = Event(event_type, data)
+        await self.event_queue.put(event)
 
-        # Check if we should trigger improvement loop
-        print(f"[Loop 3] 📊 Total reviews completed: {trace_count}")
+        logger.debug(
+            "Event emitted",
+            event_type=event_type.value,
+            queue_size=self.event_queue.qsize()
+        )
 
-        if trace_count % self.improvement_frequency == 0 and trace_count > 0:
-            print(f"\n[Loop 3] 🔄 Triggering self-improvement analysis...")
-            print("[Loop 3] (Run 'python -m src.main improve' to analyze and optimize)")
+    async def process_event(self, event: Event):
+        """
+        Process a single event.
 
-        print(f"\n[Loop 3] ✅ Review complete! (Total time: {duration:.2f}s)\n")
+        Args:
+            event: Event to process
+        """
+        handlers = self.handlers.get(event.event_type, [])
 
-        return trace
+        if not handlers:
+            logger.warning(
+                "No handlers for event",
+                event_type=event.event_type.value
+            )
+            return
+
+        logger.debug(
+            "Processing event",
+            event_type=event.event_type.value,
+            num_handlers=len(handlers)
+        )
+
+        # Execute all handlers for this event
+        for handler in handlers:
+            try:
+                await handler(event.data)
+            except Exception as e:
+                logger.error(
+                    "Handler failed",
+                    event_type=event.event_type.value,
+                    handler=handler.__name__,
+                    error=str(e)
+                )
+
+    async def run(self):
+        """
+        Run the event loop (process events from queue).
+
+        This is a long-running task that should be run in the background.
+        """
+        self.running = True
+
+        logger.info("Event Loop started")
+
+        while self.running:
+            try:
+                # Wait for event with timeout
+                event = await asyncio.wait_for(
+                    self.event_queue.get(),
+                    timeout=1.0
+                )
+
+                await self.process_event(event)
+
+            except asyncio.TimeoutError:
+                # No events, continue
+                continue
+            except Exception as e:
+                logger.error("Event loop error", error=str(e))
+
+        logger.info("Event Loop stopped")
+
+    def stop(self):
+        """Stop the event loop."""
+        self.running = False
+        logger.info("Event Loop stop requested")
+
+    async def schedule_task(
+        self,
+        task_func: Callable,
+        delay: float = 0,
+        interval: Optional[float] = None
+    ):
+        """
+        Schedule a background task.
+
+        Args:
+            task_func: Async function to run
+            delay: Initial delay in seconds
+            interval: If set, repeat task at this interval
+        """
+        async def _run_task():
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            while True:
+                try:
+                    await task_func()
+                except Exception as e:
+                    logger.error(
+                        "Scheduled task failed",
+                        task=task_func.__name__,
+                        error=str(e)
+                    )
+
+                if interval is None:
+                    break
+
+                await asyncio.sleep(interval)
+
+        task = asyncio.create_task(_run_task())
+        self.tasks.append(task)
+
+        logger.info(
+            "Task scheduled",
+            task=task_func.__name__,
+            delay=delay,
+            interval=interval
+        )
+
+        return task
+
+    def get_status(self) -> dict:
+        """Get event loop status."""
+        return {
+            "running": self.running,
+            "queue_size": self.event_queue.qsize(),
+            "num_handlers": sum(len(handlers) for handlers in self.handlers.values()),
+            "active_tasks": len([t for t in self.tasks if not t.done()])
+        }
+
+
+# Global event loop instance
+event_loop = EventLoop()

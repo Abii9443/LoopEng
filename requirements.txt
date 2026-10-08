@@ -1,11 +1,33 @@
-langchain>=0.1.0
-langchain-openai>=0.0.5
-openai>=1.12.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-pylint>=3.0.0
-flake8>=7.0.0
-rich>=13.0.0
-click>=8.1.0
+# Loop Engineering POC - Dependencies
+
+# HuggingFace & ML
+transformers>=4.35.0
+torch>=2.0.0
+sentence-transformers>=2.2.0
+datasets>=2.14.0
+accelerate>=0.25.0
+
+# Storage
+faiss-cpu>=1.7.4
+sqlalchemy>=2.0.0
+
+# Data & Configuration
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
 python-dotenv>=1.0.0
-pytest>=8.0.0
+
+# CLI & Display
+click>=8.1.0
+rich>=13.0.0
+
+# Async
+aiofiles>=23.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Utilities
+structlog>=23.0.0
+tenacity>=8.2.0
+numpy>=1.24.0
